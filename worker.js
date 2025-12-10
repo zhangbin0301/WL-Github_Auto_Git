@@ -3,26 +3,53 @@
 export default {
   async scheduled(event, env, ctx) {
     const repos = getRepoConfigs(env);
+    const forceUpdate = env.FORCE !== 'false'; // 默认 true
+    
     console.log(`Found ${repos.length} repositories to update`);
+    console.log(`Force update mode: ${forceUpdate}`);
+    
+    // 读取上次更新时间
+    let lastUpdateTimes = {};
+    if (env.STATUS_KV) {
+      const cached = await env.STATUS_KV.get('last_update_times');
+      if (cached) {
+        lastUpdateTimes = JSON.parse(cached);
+      }
+    }
     
     const results = await Promise.allSettled(
-      repos.map(repo => updateRepo(repo))
+      repos.map(repo => updateRepo(repo, forceUpdate, false, lastUpdateTimes))
     );
+    
+    // 更新最后更新时间
+    const newUpdateTimes = {};
+    results.forEach((result, index) => {
+      const repoKey = `repo_${repos[index].index}`;
+      if (result.status === 'fulfilled' && !result.value.skipped && !result.value.rateLimited) {
+        newUpdateTimes[repoKey] = new Date().toISOString();
+      } else if (lastUpdateTimes[repoKey]) {
+        newUpdateTimes[repoKey] = lastUpdateTimes[repoKey];
+      }
+    });
     
     // 保存执行结果到 KV
     const statusData = results.map((result, index) => ({
       repo: repos[index].repo,
+      weburl: repos[index].weburl,
       index: repos[index].index,
       status: result.status === 'fulfilled' ? 'success' : 'failed',
       time: new Date().toISOString(),
       message: result.status === 'fulfilled' 
-        ? 'Commit successful' 
-        : result.reason?.message || 'Unknown error'
+        ? result.value.message
+        : result.reason?.message || 'Unknown error',
+      skipped: result.status === 'fulfilled' ? result.value.skipped : false,
+      rateLimited: result.status === 'fulfilled' ? result.value.rateLimited : false
     }));
     
     // 存储到 KV (如果配置了)
     if (env.STATUS_KV) {
       await env.STATUS_KV.put('latest_status', JSON.stringify(statusData));
+      await env.STATUS_KV.put('last_update_times', JSON.stringify(newUpdateTimes));
     }
     
     results.forEach((result, index) => {
@@ -70,7 +97,7 @@ export default {
       });
     }
     
-    // 路由：手动触发执行
+    // 路由：手动触发执行 (强制更新，不检查网址和频率限制)
     if (url.pathname === '/api/trigger') {
       const repos = getRepoConfigs(env);
       
@@ -81,23 +108,45 @@ export default {
         });
       }
       
+      // 手动触发时强制更新，不受 FORCE 和频率限制影响
       const results = await Promise.allSettled(
-        repos.map(repo => updateRepo(repo))
+        repos.map(repo => updateRepo(repo, false, true, {})) // true = 手动触发，跳过频率检查
       );
+      
+      // 更新最后更新时间
+      let lastUpdateTimes = {};
+      if (env.STATUS_KV) {
+        const cached = await env.STATUS_KV.get('last_update_times');
+        if (cached) {
+          lastUpdateTimes = JSON.parse(cached);
+        }
+      }
+      
+      const newUpdateTimes = { ...lastUpdateTimes };
+      results.forEach((result, index) => {
+        const repoKey = `repo_${repos[index].index}`;
+        if (result.status === 'fulfilled' && !result.value.skipped) {
+          newUpdateTimes[repoKey] = new Date().toISOString();
+        }
+      });
       
       const statusData = results.map((result, index) => ({
         repo: repos[index].repo,
+        weburl: repos[index].weburl,
         index: repos[index].index,
         status: result.status === 'fulfilled' ? 'success' : 'failed',
         time: new Date().toISOString(),
         message: result.status === 'fulfilled' 
-          ? 'Commit successful' 
-          : result.reason?.message || 'Unknown error'
+          ? result.value.message
+          : result.reason?.message || 'Unknown error',
+        skipped: result.status === 'fulfilled' ? result.value.skipped : false,
+        rateLimited: false // 手动触发不受频率限制
       }));
       
       // 保存到 KV
       if (env.STATUS_KV) {
         await env.STATUS_KV.put('latest_status', JSON.stringify(statusData));
+        await env.STATUS_KV.put('last_update_times', JSON.stringify(newUpdateTimes));
       }
       
       return new Response(JSON.stringify(statusData), {
@@ -168,6 +217,7 @@ function getRepoConfigs(env) {
         repos.push({
           token: parsed.token,
           repo: parsed.repo,
+          weburl: parsed.weburl || null,
           index: index
         });
       } else {
@@ -184,16 +234,98 @@ function getRepoConfigs(env) {
 }
 
 /**
- * 更新单个仓库
+ * 检查网址是否可访问
  */
-async function updateRepo(config) {
-  const { token, repo, index } = config;
+async function checkWebUrl(weburl) {
+  if (!weburl) return { accessible: false, reason: 'No weburl configured' };
+  
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+    
+    const response = await fetch(weburl, {
+      method: 'HEAD',
+      signal: controller.signal,
+      redirect: 'follow'
+    });
+    
+    clearTimeout(timeoutId);
+    
+    // 认为 2xx 和 3xx 状态码都是可访问的
+    const accessible = response.status >= 200 && response.status < 400;
+    
+    return {
+      accessible,
+      status: response.status,
+      reason: accessible ? 'Website is accessible' : `HTTP ${response.status}`
+    };
+  } catch (error) {
+    return {
+      accessible: false,
+      reason: error.name === 'AbortError' ? 'Request timeout' : error.message
+    };
+  }
+}
+
+/**
+ * 更新单个仓库
+ * @param {Object} config - 仓库配置
+ * @param {boolean} checkUrl - true: 检查网址后决定是否更新, false: 强制更新
+ * @param {boolean} manualTrigger - 是否为手动触发（手动触发跳过频率限制）
+ * @param {Object} lastUpdateTimes - 上次更新时间记录
+ */
+async function updateRepo(config, checkUrl = true, manualTrigger = false, lastUpdateTimes = {}) {
+  const { token, repo, weburl, index } = config;
   const [owner, repoName] = repo.split('/');
   
   if (!owner || !repoName) {
     throw new Error(`Invalid repo format: ${repo}. Expected: owner/repo`);
   }
   
+  // 检查频率限制（手动触发时跳过）
+  if (!manualTrigger) {
+    const repoKey = `repo_${index}`;
+    const lastUpdate = lastUpdateTimes[repoKey];
+    
+    if (lastUpdate) {
+      const lastUpdateTime = new Date(lastUpdate);
+      const now = new Date();
+      const diffMinutes = (now - lastUpdateTime) / 1000 / 60;
+      
+      if (diffMinutes < 10) {
+        const remainingMinutes = Math.ceil(10 - diffMinutes);
+        console.log(`Repo ${index}: Rate limited, last update was ${Math.floor(diffMinutes)} minutes ago`);
+        return {
+          success: true,
+          skipped: false,
+          rateLimited: true,
+          message: `Rate limited: Please wait ${remainingMinutes} more minute(s)`,
+          time: new Date().toISOString()
+        };
+      }
+    }
+  }
+  
+  // 如果需要检查网址
+  if (checkUrl && weburl) {
+    console.log(`Repo ${index}: Checking weburl ${weburl}`);
+    const urlCheck = await checkWebUrl(weburl);
+    
+    if (urlCheck.accessible) {
+      console.log(`Repo ${index}: Website is accessible, skipping update`);
+      return {
+        success: true,
+        skipped: true,
+        rateLimited: false,
+        message: `Skipped: Website accessible (${urlCheck.reason})`,
+        time: new Date().toISOString()
+      };
+    }
+    
+    console.log(`Repo ${index}: Website not accessible (${urlCheck.reason}), proceeding with update`);
+  }
+  
+  // 执行 GitHub 更新
   const branch = await getDefaultBranch(owner, repoName, token);
   const latestCommitSha = await getLatestCommit(owner, repoName, branch, token);
   const treeSha = await getTreeSha(owner, repoName, latestCommitSha, token);
@@ -206,7 +338,16 @@ async function updateRepo(config) {
   await updateRef(owner, repoName, branch, newCommitSha, token);
   
   console.log(`Repo ${index} (${repo}) updated at ${currentTime}`);
-  return { success: true, time: currentTime };
+  
+  const triggerType = manualTrigger ? 'manual trigger' : 'website check failed';
+  
+  return {
+    success: true,
+    skipped: false,
+    rateLimited: false,
+    message: `Commit successful (${triggerType})`,
+    time: currentTime
+  };
 }
 
 /**
@@ -386,10 +527,10 @@ function getLoginHTML() {
     <h1>需要身份验证</h1>
     <p class="subtitle">请输入密码访问监控页面</p>
     <div class="message">
-      认证失败，请检查密码是否正确
+      认证失败,请检查密码是否正确
     </div>
     <div class="info">
-      <strong>💡 提示：</strong><br>
+      <strong>💡 提示:</strong><br>
       • 用户名可以输入任意内容<br>
       • 密码为环境变量 PSWD 设置的值<br>
       • 浏览器会记住您的登录状态
@@ -529,6 +670,16 @@ function getStatusHTML() {
       color: #742a2a;
     }
     
+    .status-skipped {
+      background: #fef5e7;
+      color: #975a16;
+    }
+    
+    .status-ratelimited {
+      background: #e8f4fd;
+      color: #1e5a8e;
+    }
+    
     .status-unknown {
       background: #e2e8f0;
       color: #4a5568;
@@ -554,6 +705,17 @@ function getStatusHTML() {
     .info-value {
       color: #2d3748;
       font-weight: 600;
+    }
+    
+    .weburl {
+      margin-top: 8px;
+      padding: 8px;
+      background: #f7fafc;
+      border-radius: 4px;
+      font-size: 12px;
+      color: #4a5568;
+      word-break: break-all;
+      font-family: 'Courier New', monospace;
     }
     
     .message {
@@ -618,7 +780,7 @@ function getStatusHTML() {
       <p class="subtitle">实时监控自动提交任务状态</p>
       <div class="controls">
         <button onclick="refreshStatus()">🔄 刷新状态</button>
-        <button onclick="triggerNow()" id="triggerBtn">▶️ 立即执行</button>
+        <button onclick="triggerNow()" id="triggerBtn">▶️ 立即执行 (强制)</button>
       </div>
     </div>
     
@@ -643,7 +805,6 @@ function getStatusHTML() {
       const now = new Date();
       const diff = now - date;
       
-      // 显示相对时间
       const seconds = Math.floor(diff / 1000);
       const minutes = Math.floor(seconds / 60);
       const hours = Math.floor(minutes / 60);
@@ -681,7 +842,7 @@ function getStatusHTML() {
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path>
               </svg>
               <h3>暂无数据</h3>
-              <p>尚未执行过任何任务，请点击"立即执行"按钮开始</p>
+              <p>尚未执行过任何任务,请点击"立即执行"按钮开始</p>
             </div>
           \`;
           return;
@@ -689,8 +850,21 @@ function getStatusHTML() {
         
         content.className = 'status-grid';
         content.innerHTML = data.map(item => {
-          const statusClass = item.status === 'success' ? 'status-success' : 'status-failed';
-          const statusText = item.status === 'success' ? '✓ 成功' : '✗ 失败';
+          let statusClass, statusText;
+          
+          if (item.rateLimited) {
+            statusClass = 'status-ratelimited';
+            statusText = '⏱ 限频';
+          } else if (item.skipped) {
+            statusClass = 'status-skipped';
+            statusText = '⊘ 跳过';
+          } else if (item.status === 'success') {
+            statusClass = 'status-success';
+            statusText = '✓ 成功';
+          } else {
+            statusClass = 'status-failed';
+            statusText = '✗ 失败';
+          }
           
           return \`
             <div class="status-card">
@@ -707,6 +881,7 @@ function getStatusHTML() {
                   <span class="info-label">最后更新</span>
                   <span class="info-value">\${formatTime(item.time)}</span>
                 </div>
+                \${item.weburl ? \`<div class="weburl">🌐 \${item.weburl}</div>\` : ''}
                 \${item.message ? \`<div class="message">\${item.message}</div>\` : ''}
               </div>
             </div>
@@ -736,12 +911,12 @@ function getStatusHTML() {
         await loadStatus();
         btn.textContent = '✓ 执行完成';
         setTimeout(() => {
-          btn.textContent = '▶️ 立即执行';
+          btn.textContent = '▶️ 立即执行 (强制)';
           btn.disabled = false;
         }, 2000);
       } catch (error) {
         alert('执行失败: ' + error.message);
-        btn.textContent = '▶️ 立即执行';
+        btn.textContent = '▶️ 立即执行 (强制)';
         btn.disabled = false;
       }
     }
@@ -750,10 +925,7 @@ function getStatusHTML() {
       loadStatus();
     }
     
-    // 页面加载时获取状态
     loadStatus();
-    
-    // 每30秒自动刷新
     setInterval(loadStatus, 30000);
   </script>
 </body>
