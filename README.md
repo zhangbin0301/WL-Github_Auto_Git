@@ -89,6 +89,9 @@
 变量名: PSWD
 值: your_secure_password_here
 类型: Text
+# 更新模式 (可选,默认 true)
+FORCE=true   # 检查网址后更新
+FORCE=false  # 无条件更新
 ```
 
 > 🔒 **密码保护说明**：
