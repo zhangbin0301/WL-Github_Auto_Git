@@ -16,7 +16,6 @@
 这个 Cloudflare Worker 可以：
 
 ✅ 定时向多个 GitHub 私密仓库提交文件  
-✅ 在仓库根目录创建/更新 `time.txt` 文件  
 ✅ 支持无限数量的仓库（GITHUB1, GITHUB2, GITHUB3...）  
 ✅ 提供实时监控页面，查看每个仓库的提交状态  
 ✅ 仓库地址自动遮掩保护隐私  
