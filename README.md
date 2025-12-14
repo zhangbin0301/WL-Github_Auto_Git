@@ -99,7 +99,7 @@ FORCE=false  # 无条件更新
 > - 用户名可以是任意值，只验证密码
 > - 不设置 PSWD 则无需密码，任何人都可访问
 
-**添加第一个仓库带网址监控：**
+**添加第一个仓库带网址监控： 变量和机密--添加--文本--变量名：GITHUB1--值{"token":"ghp_xxx******}**
 ```
 # 仓库配置（支持可选的 name 和多个 weburl）
 GITHUB1 = {"token":"ghp_xxx","repo":"user/repo","weburl":"https://site1.com,https://site2.com","name":"我的博客"}
