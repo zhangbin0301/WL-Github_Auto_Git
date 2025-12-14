@@ -102,16 +102,21 @@ FORCE=false  # 无条件更新
 
 **添加第一个仓库带网址监控：**
 ```
-变量名: GITHUB1
-值: {"weburl":"https://可选，网址不通时更新","token":"ghp_your_token_here","repo":"username/repo-name"}
-类型: Text
-```
+# 仓库配置（支持可选的 name 和多个 weburl）
+GITHUB1 = {"token":"ghp_xxx","repo":"user/repo","weburl":"https://site1.com,https://site2.com","name":"我的博客"}
+GITHUB2 = {"token":"ghp_yyy","repo":"user/repo2","weburl":"https://site3.com","name":"项目文档"}
 
-**添加第二个仓库不带网址监控：**
-```
-变量名: GITHUB2
-值: {"token":"ghp_another_token","repo":"org/another-repo"}
-类型: Text
+# Telegram 通知（格式：chat_id token）
+TG = "123456789 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+
+# 密码保护（可选）
+PSWD = "your_password"
+
+# KV 命名空间绑定
+STATUS_KV = your_kv_namespace
+
+# 强制更新模式（可选，默认 true）
+FORCE = "true"
 ```
 
 **继续添加更多仓库：**
