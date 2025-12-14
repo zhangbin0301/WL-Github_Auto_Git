@@ -106,7 +106,7 @@ GITHUB1 = {"token":"ghp_xxx","repo":"user/repo","weburl":"https://site1.com,http
 GITHUB2 = {"token":"ghp_yyy","repo":"user/repo2","weburl":"https://site3.com","name":"项目文档"}
 
 # Telegram 通知（格式：chat_id token）
-TG = "123456789 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
+TG = 123456789 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
 
 ```
 
